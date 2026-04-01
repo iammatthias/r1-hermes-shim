@@ -1,0 +1,4 @@
+--- a/hermes_cli/tools_config.py
++++ b/hermes_cli/tools_config.py
+@@ Add to the PLATFORMS dict:
++    "r1_shim": {"label": "🐰 Rabbit R1", "default_toolset": "hermes-telegram"},

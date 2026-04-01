@@ -1,0 +1,21 @@
+--- a/gateway/config.py
++++ b/gateway/config.py
+@@ Add to Platform enum (after WECOM = "wecom"):
++    R1_SHIM = "r1_shim"
+
+@@ Add before "return config" in load_gateway_config():
++    # R1 Shim (Rabbit R1 OpenClaw-compatible gateway)
++    r1_shim_enabled = os.getenv("R1_SHIM_ENABLED", "").lower() in ("true", "1", "yes")
++    r1_shim_token = os.getenv("R1_SHIM_TOKEN", "")
++    r1_shim_port = os.getenv("R1_SHIM_PORT")
++    if r1_shim_enabled or r1_shim_token:
++        if Platform.R1_SHIM not in config.platforms:
++            config.platforms[Platform.R1_SHIM] = PlatformConfig()
++        config.platforms[Platform.R1_SHIM].enabled = True
++        if r1_shim_token:
++            config.platforms[Platform.R1_SHIM].extra["token"] = r1_shim_token
++        if r1_shim_port:
++            try:
++                config.platforms[Platform.R1_SHIM].extra["port"] = int(r1_shim_port)
++            except ValueError:
++                pass
