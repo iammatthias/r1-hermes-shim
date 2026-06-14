@@ -2,11 +2,7 @@
 
 A third-party OpenClaw-compatible WebSocket gateway that connects a [Rabbit R1](https://www.rabbit.tech/) to [Hermes Agent](https://github.com/NousResearch/hermes-agent) as a first-class messaging channel.
 
-> **This is not a Hermes feature.** It's a small side project: an adapter plus a few source
-> patches you apply to your own Hermes install. The R1 then talks to the patched gateway exactly
-> like it would talk to OpenClaw, and messages route through the Hermes agent pipeline — same
-> model, same memory, same tools, same sessions as Telegram or any other channel. Tested against
-> Hermes `v0.16.0` (tag `v2026.6.5`); upstream Hermes does **not** ship `r1_shim`.
+The R1 talks to the patched gateway exactly like it would talk to OpenClaw, and messages route through the Hermes agent pipeline — same model, same memory, same tools, same sessions as Telegram or any other channel. Tested against Hermes `v0.16.0` (tag `v2026.6.5`).
 
 ## How It Works
 
