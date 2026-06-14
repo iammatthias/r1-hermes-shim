@@ -50,7 +50,19 @@ done
 cp gateway/platforms/r1_shim.py "$HERMES_SRC/gateway/platforms/"
 ```
 
-### 3. Patch `gateway/config.py`
+### 3–4. Apply the source patch
+
+If your Hermes is exactly tag `v2026.6.5`, apply both source edits in one shot (idempotent):
+
+```bash
+P=/tmp/r1-shim.patch
+curl -sL https://raw.githubusercontent.com/iammatthias/r1-hermes-shim/main/patches/hermes-v2026.6.5.patch -o "$P"
+git -C "$HERMES_SRC" apply --reverse --check "$P" 2>/dev/null && echo "already applied" || git -C "$HERMES_SRC" apply "$P"
+```
+
+If it doesn't apply cleanly your Hermes is a different version — do steps 3 and 4 by hand instead.
+
+### 3. Patch `gateway/config.py` (manual)
 
 Add `R1_SHIM = "r1_shim"` to the `Platform` enum (e.g. after `WECOM = "wecom"`), and add this
 block before `return config` in `load_gateway_config()`:

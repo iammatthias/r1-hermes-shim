@@ -36,6 +36,22 @@ curl -sL https://raw.githubusercontent.com/iammatthias/r1-hermes-shim/main/gatew
   -o "$HERMES_SRC/gateway/platforms/r1_shim.py"
 ```
 
+### Quick apply for a pinned tag (recommended on v2026.6.5)
+
+`$HERMES_SRC` is a git checkout, so if your Hermes is exactly tag `v2026.6.5` you can apply the
+config.py + run.py edits (steps 3–4) in one shot with the verified patch — idempotent via the
+reverse-check:
+
+```bash
+P=/tmp/r1-shim.patch
+curl -sL https://raw.githubusercontent.com/iammatthias/r1-hermes-shim/main/patches/hermes-v2026.6.5.patch -o "$P"
+if git -C "$HERMES_SRC" apply --reverse --check "$P" 2>/dev/null; then echo "already applied"
+elif git -C "$HERMES_SRC" apply --check "$P" 2>/dev/null; then git -C "$HERMES_SRC" apply "$P"; echo applied
+else echo "does not apply cleanly — your Hermes is not v2026.6.5; use the manual steps below"; fi
+```
+
+If that applied cleanly, skip to step 6. Otherwise (different Hermes version), do steps 3–4 by hand:
+
 ## 3. Patch gateway/config.py
 
 **3a.** Add `R1_SHIM = "r1_shim"` to the `Platform` enum (e.g. after `WECOM = "wecom"`). Idempotent
