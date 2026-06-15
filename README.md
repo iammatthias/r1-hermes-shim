@@ -238,9 +238,14 @@ The pairing QR payload (what `tools/make_qr.py` encodes) is:
   `/?token=<gateway-token>` lists pending devices).
 - **Voice — inbound** ✅ — the R1 transcribes speech on-device and sends it as `chat.send` text, so
   *talking to it* already works.
-- **Voice — talk-back (TTS)** ⚠️ — the R1 does **not** speak replies yet; the response→speech
-  trigger isn't in the captured protocol. Inbound frames are now logged to
-  `~/.hermes/r1_shim/events.jsonl` (`paramKeys` + a `paramsSnippet`) to reverse-engineer it.
+- **Voice — talk-back (TTS)** ✅ — the shim answers the R1's `talk.speak` RPC with synthesized
+  audio (edge-tts, free, no key). Voice via `R1_SHIM_TTS_VOICE` (default `en-US-AriaNeural`);
+  format via `R1_SHIM_TTS_FORMAT` = `mp3` (default, MediaPlayer) or `pcm` (raw `pcm_24000` →
+  AudioTrack, lower latency, transcoded by ffmpeg). On synthesis failure it returns a
+  fallback-eligible error so the R1 uses its **own on-device TTS** instead of going silent.
+  **Gated on the device:** the R1 only calls `talk.speak` when its on-device *"speak replies"*
+  toggle is on — the gateway can't force it. (Mechanism confirmed from the OpenClaw source: the
+  device drives TTS via `talk.speak`; the gateway never pushes audio for chat replies.)
 - **Camera** ⚠️ — photos taken on the R1 have only ever reached the shim as `chat.send` *text*;
   whether image bytes ride in the params (vs. never leaving the device) is being captured.
 - **No streaming** — replies are a single delta+final pair, not incremental tokens (true streaming

@@ -39,6 +39,13 @@ except ImportError:
     web = None
     WSMsgType = None
 
+try:
+    import edge_tts
+    EDGE_TTS_AVAILABLE = True
+except ImportError:
+    edge_tts = None
+    EDGE_TTS_AVAILABLE = False
+
 from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource
 from gateway.platforms.base import (
@@ -73,6 +80,12 @@ class R1ShimAdapter(BasePlatformAdapter):
         self._port = int(extra.get("port", os.getenv("R1_SHIM_PORT", str(DEFAULT_PORT))))
         self._token = extra.get("token", os.getenv("R1_SHIM_TOKEN", secrets.token_hex(32)))
         self._auto_approve = str(extra.get("auto_approve", os.getenv("R1_SHIM_AUTO_APPROVE", "true"))).lower() not in ("0", "false", "no")
+        # Talk-back (TTS): the R1 calls the talk.speak RPC when its on-device "speak replies"
+        # toggle is on; we synthesize and return base64 audio. Voice = an edge-tts voice name
+        # (free, no key). Format: "mp3" (MediaPlayer, robust) or "pcm" (raw pcm_24000 ->
+        # AudioTrack, lower latency; transcoded via ffmpeg).
+        self._tts_voice = extra.get("tts_voice", os.getenv("R1_SHIM_TTS_VOICE", "en-US-AriaNeural"))
+        self._tts_format = str(extra.get("tts_format", os.getenv("R1_SHIM_TTS_FORMAT", "mp3"))).lower()
         self._runner = None
         self._site = None
         self._app = None
@@ -353,6 +366,12 @@ class R1ShimAdapter(BasePlatformAdapter):
                         attachments=attachments,
                     ))
 
+                elif method in ("talk.speak", "tts.convert"):
+                    # Talk-back: the R1 asks us to synthesize an assistant reply (or any text)
+                    # and returns the audio in the RPC response. Run it off the read loop so
+                    # synthesis latency doesn't stall other frames.
+                    asyncio.create_task(self._handle_talk_speak(ws, rid, params))
+
                 else:
                     # Echo unknown methods
                     await ws.send_json({"type": "res", "id": rid, "ok": True, "payload": {"method": method}})
@@ -363,6 +382,74 @@ class R1ShimAdapter(BasePlatformAdapter):
             self._device_ws.pop(device_id, None)
         self._log_event({"type": "ws_close", "connId": conn_id})
         return ws
+
+    async def _handle_talk_speak(self, ws, rid, params) -> None:
+        """Answer the R1's talk.speak RPC with synthesized audio (talk-back).
+
+        The R1 fires talk.speak (when its on-device "speak replies" toggle is on) carrying
+        the assistant text; we synthesize via edge-tts and return base64 audio in the RPC
+        response. On any failure we return a fallback-eligible error so the R1 falls back to
+        its own on-device Android TTS instead of going silent.
+        """
+        text = (params.get("text") or "").strip() if isinstance(params, dict) else ""
+        if not text:
+            await ws.send_json({"type": "res", "id": rid, "ok": False,
+                                "error": {"code": "INVALID_ARGUMENT", "message": "empty text"}})
+            return
+        # The R1 may pass an ElevenLabs-style voiceId edge-tts won't know; only honor it if it
+        # looks like a Microsoft voice (e.g. en-US-AriaNeural), else use the configured default.
+        voice = params.get("voiceId") or self._tts_voice
+        if not isinstance(voice, str) or "Neural" not in voice:
+            voice = self._tts_voice
+        try:
+            audio = await self._tts_synthesize(text, voice)
+            if not audio:
+                raise RuntimeError("empty audio from synthesizer")
+            if self._tts_format == "pcm":
+                audio = await self._tts_to_pcm24k(audio)
+                out_format, mime, ext = "pcm_24000", None, None
+            else:
+                out_format, mime, ext = "mp3_24000_48", "audio/mpeg", ".mp3"
+            await ws.send_json({"type": "res", "id": rid, "ok": True, "payload": {
+                "audioBase64": base64.b64encode(audio).decode("ascii"),
+                "provider": "edge",
+                "outputFormat": out_format,
+                "mimeType": mime,
+                "fileExtension": ext,
+            }})
+            self._log_event({"type": "talk_speak", "chars": len(text),
+                             "bytes": len(audio), "format": out_format})
+        except Exception as e:
+            logger.warning("[r1_shim] talk.speak synth failed (%s) — R1 will use on-device TTS", e)
+            await ws.send_json({"type": "res", "id": rid, "ok": False,
+                "error": {"code": "UNAVAILABLE", "message": f"tts failed: {str(e)[:160]}",
+                          "details": {"reason": "talk_unconfigured", "fallbackEligible": True}}})
+            self._log_event({"type": "talk_speak_fallback", "error": str(e)[:200]})
+
+    async def _tts_synthesize(self, text: str, voice: str) -> bytes:
+        """Synthesize speech to MP3 bytes via edge-tts (free, no API key)."""
+        if not EDGE_TTS_AVAILABLE:
+            raise RuntimeError("edge-tts not installed")
+        communicate = edge_tts.Communicate(text, voice)
+        buf = bytearray()
+        async for chunk in communicate.stream():
+            if chunk.get("type") == "audio" and chunk.get("data"):
+                buf.extend(chunk["data"])
+        return bytes(buf)
+
+    async def _tts_to_pcm24k(self, mp3_bytes: bytes) -> bytes:
+        """Transcode MP3 -> raw signed-16-bit LE mono PCM @ 24kHz (the R1's AudioTrack format)."""
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", "pipe:0", "-f", "s16le", "-acodec", "pcm_s16le",
+            "-ac", "1", "-ar", "24000", "pipe:1",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate(mp3_bytes)
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {err[:200].decode('utf-8', 'replace')}")
+        return out
 
     def _save_attachments(self, attachments) -> Tuple[List[str], List[str]]:
         """Decode inbound R1 attachments (base64) to files Hermes vision can read.
