@@ -227,14 +227,25 @@ The pairing QR payload (what `tools/make_qr.py` encodes) is:
 {"type":"clawdbot-gateway","version":1,"ips":["<lan-ip>"],"port":18790,"token":"<token>","protocol":"ws"}
 ```
 
-## Known Limitations
+## Capabilities & limitations
 
-- **Patches get wiped by `hermes update`** — re-apply the shim after upgrading Hermes (see above)
-- **No streaming** — Responses sent as single delta+final pair, not incremental tokens
-- **No voice** — R1 mic/speaker not integrated yet
-- **No camera** — R1 camera not integrated yet
-- **No proactive delivery** — `send()` is a no-op; R1 can't receive cron/cross-platform messages yet (see [Delivering the QR after a reboot](#delivering-the-qr-after-a-reboot) for the pairing-QR workaround)
-- **Auto-approve only** — All devices are auto-approved on pairing
+- **Proactive delivery** ✅ — `send()` pushes a message to a connected R1 (cron jobs, cross-platform
+  routing via the gateway's `DeliveryRouter`). Messages for an offline R1 are queued and flushed on
+  its next connect (capped per device).
+- **Device approval** ✅ — `auto_approve: true` (default) keeps pair-on-connect. Set
+  `R1_SHIM_AUTO_APPROVE=false` (or `extra.auto_approve: false`) to hold new devices as `pending`;
+  approve at `http://<host>:<port>/approve?token=<gateway-token>&deviceId=<id>` (the admin page at
+  `/?token=<gateway-token>` lists pending devices).
+- **Voice — inbound** ✅ — the R1 transcribes speech on-device and sends it as `chat.send` text, so
+  *talking to it* already works.
+- **Voice — talk-back (TTS)** ⚠️ — the R1 does **not** speak replies yet; the response→speech
+  trigger isn't in the captured protocol. Inbound frames are now logged to
+  `~/.hermes/r1_shim/events.jsonl` (`paramKeys` + a `paramsSnippet`) to reverse-engineer it.
+- **Camera** ⚠️ — photos taken on the R1 have only ever reached the shim as `chat.send` *text*;
+  whether image bytes ride in the params (vs. never leaving the device) is being captured.
+- **No streaming** — replies are a single delta+final pair, not incremental tokens (true streaming
+  would couple to Hermes' per-platform streaming internals).
+- **Patches get wiped by `hermes update`** — re-apply the shim after upgrading Hermes (see above).
 
 ## License
 

@@ -13,7 +13,11 @@ Configuration in config.yaml:
       extra:
         port: 18789
         token: "<your-token>"  # or set R1_SHIM_TOKEN env var
-        auto_approve: true
+        auto_approve: true       # false => new devices wait for operator approval
+
+Proactive delivery: send() pushes a message to a connected R1 (used by cron and
+cross-platform routing via the gateway's DeliveryRouter). Messages for an offline
+R1 are queued and flushed on its next connect.
 """
 
 import asyncio
@@ -47,6 +51,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PORT = 18789
 STATE_DIR_NAME = "r1_shim"
+# Cap the offline queue per device so a long-offline R1 can't grow it without bound.
+MAX_PENDING_PER_DEVICE = 50
 
 
 def check_r1_shim_requirements() -> bool:
@@ -71,14 +77,20 @@ class R1ShimAdapter(BasePlatformAdapter):
         self._app = None
         self._paired: Dict[str, Dict[str, Any]] = {}
         self._device_tokens: set = set()
+        # conn_id -> ws (every live socket) and device_id -> ws (newest socket per device,
+        # for proactive send()). Both cleared as sockets close.
         self._active_ws: Dict[str, web.WebSocketResponse] = {}
+        self._device_ws: Dict[str, web.WebSocketResponse] = {}
         self._pending_responses: Dict[str, asyncio.Future] = {}
+        # device_id -> [text, ...] queued while the R1 was offline; flushed on connect.
+        self._pending: Dict[str, List[str]] = {}
 
         # State persistence
         from hermes_constants import get_hermes_home
         self._state_dir = get_hermes_home() / STATE_DIR_NAME
         self._state_dir.mkdir(parents=True, exist_ok=True)
         self._load_state()
+        self._load_pending()
 
     def _load_state(self):
         state_file = self._state_dir / "paired.json"
@@ -86,8 +98,12 @@ class R1ShimAdapter(BasePlatformAdapter):
             try:
                 data = json.loads(state_file.read_text())
                 self._paired = data.get("paired", {})
+                # Only approved devices contribute a valid reconnect token. Devices
+                # predating the approval flow have no "status" — treat as approved.
                 self._device_tokens = set(
-                    p.get("deviceToken") for p in self._paired.values() if p.get("deviceToken")
+                    p.get("deviceToken")
+                    for p in self._paired.values()
+                    if p.get("deviceToken") and self._is_approved(p)
                 )
             except Exception:
                 pass
@@ -96,34 +112,116 @@ class R1ShimAdapter(BasePlatformAdapter):
         state_file = self._state_dir / "paired.json"
         state_file.write_text(json.dumps({"paired": self._paired}, indent=2))
 
+    def _load_pending(self):
+        pending_file = self._state_dir / "pending.json"
+        if pending_file.exists():
+            try:
+                self._pending = json.loads(pending_file.read_text()) or {}
+            except Exception:
+                self._pending = {}
+
+    def _save_pending(self):
+        (self._state_dir / "pending.json").write_text(json.dumps(self._pending))
+
     def _log_event(self, event: Dict[str, Any]):
         log_file = self._state_dir / "events.jsonl"
         row = {"ts": _now_ms(), **event}
         with log_file.open("a") as f:
             f.write(json.dumps(row) + "\n")
 
+    @staticmethod
+    def _is_approved(paired: Dict[str, Any]) -> bool:
+        # Missing status (legacy devices) counts as approved for backward compat.
+        return paired.get("status", "approved") == "approved"
+
     def _ensure_device(self, device_id: str, connect_params: Dict[str, Any]) -> Dict[str, Any]:
         if device_id in self._paired:
             return self._paired[device_id]
+        approved = self._auto_approve
         token = secrets.token_hex(32)
+        client = connect_params.get("client", {})
         paired = {
             "deviceId": device_id,
-            "displayName": connect_params.get("client", {}).get("displayName", "Unknown"),
-            "platform": connect_params.get("client", {}).get("platform"),
-            "deviceFamily": connect_params.get("client", {}).get("deviceFamily"),
+            "displayName": client.get("displayName", "Unknown"),
+            "platform": client.get("platform"),
+            "deviceFamily": client.get("deviceFamily"),
             "deviceToken": token,
-            "approvedAtMs": _now_ms(),
+            "status": "approved" if approved else "pending",
+            "createdAtMs": _now_ms(),
+            "approvedAtMs": _now_ms() if approved else None,
         }
         self._paired[device_id] = paired
-        self._device_tokens.add(token)
+        if approved:
+            self._device_tokens.add(token)
         self._save_state()
-        self._log_event({"type": "paired", "deviceId": device_id})
+        self._log_event({"type": "approved" if approved else "pending", "deviceId": device_id})
+        if not approved:
+            logger.info("[r1_shim] device %s is pending approval (auto_approve=false). "
+                        "Approve at http://<host>:%d/approve?token=<gateway-token>&deviceId=%s",
+                        device_id, self._port, device_id)
         return paired
+
+    def approve_device(self, device_id: str) -> bool:
+        """Mark a pending device approved (operator action). Returns True if it changed."""
+        p = self._paired.get(device_id)
+        if not p:
+            return False
+        if self._is_approved(p):
+            return False
+        p["status"] = "approved"
+        p["approvedAtMs"] = _now_ms()
+        if p.get("deviceToken"):
+            self._device_tokens.add(p["deviceToken"])
+        self._save_state()
+        self._log_event({"type": "approved_by_operator", "deviceId": device_id})
+        return True
+
+    async def _send_chat_event(self, ws, content: str, run_id: Optional[str] = None,
+                               session_key: str = "main") -> None:
+        """Push a single final assistant chat event to a connected R1."""
+        await ws.send_json({
+            "type": "event", "event": "chat",
+            "payload": {
+                "runId": run_id or secrets.token_hex(8),
+                "sessionKey": session_key,
+                "seq": 0,
+                "state": "final",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": content}],
+                    "timestamp": _now_ms(),
+                },
+            },
+        })
+
+    def _queue_pending(self, device_id: str, content: str) -> None:
+        q = self._pending.setdefault(device_id, [])
+        q.append(content)
+        if len(q) > MAX_PENDING_PER_DEVICE:
+            del q[: len(q) - MAX_PENDING_PER_DEVICE]  # keep newest
+        self._save_pending()
+
+    async def _flush_pending(self, device_id: str, ws) -> None:
+        msgs = self._pending.pop(device_id, [])
+        if not msgs:
+            return
+        self._save_pending()
+        for i, m in enumerate(msgs):
+            try:
+                await self._send_chat_event(ws, m)
+                await asyncio.sleep(0.05)
+            except Exception as e:
+                logger.warning("[r1_shim] failed to flush queued message to %s: %s", device_id, e)
+                # re-queue this and the rest, preserving order
+                for leftover in msgs[i:]:
+                    self._queue_pending(device_id, leftover)
+                break
 
     async def _ws_handler(self, request: web.Request) -> web.StreamResponse:
         if request.headers.get("Upgrade", "").lower() != "websocket":
             # Serve admin page for browser visits
-            return web.Response(text=self._admin_html(), content_type="text/html")
+            token_ok = request.query.get("token", "") == self._token
+            return web.Response(text=self._admin_html(token_ok), content_type="text/html")
 
         ws = web.WebSocketResponse(heartbeat=20)
         await ws.prepare(request)
@@ -147,7 +245,17 @@ class R1ShimAdapter(BasePlatformAdapter):
             except Exception:
                 continue
 
-            self._log_event({"type": "frame_in", "connId": conn_id, "method": frame.get("method", "")})
+            # Frame capture for protocol discovery. Never log the connect frame's
+            # params (they carry the auth token); for everything else record the
+            # param keys + a truncated snapshot so new frame shapes (voice, camera,
+            # attachments, ...) can be reverse-engineered from events.jsonl.
+            _method = frame.get("method", "")
+            _params = frame.get("params", {}) if isinstance(frame.get("params"), dict) else {}
+            _log_row = {"type": "frame_in", "connId": conn_id, "method": _method,
+                        "paramKeys": sorted(_params.keys())}
+            if _method != "connect":
+                _log_row["paramsSnippet"] = json.dumps(_params)[:600]
+            self._log_event(_log_row)
 
             if frame.get("type") == "req" and frame.get("method") == "connect":
                 params = frame.get("params", {})
@@ -165,7 +273,20 @@ class R1ShimAdapter(BasePlatformAdapter):
                 device = params.get("device", {})
                 device_id = device.get("id") or secrets.token_hex(12)
                 paired = self._ensure_device(device_id, params)
+
+                # Device approval gate (no-op when auto_approve, the default).
+                if not self._is_approved(paired):
+                    await ws.send_json({
+                        "type": "res", "id": frame.get("id"), "ok": False,
+                        "error": {"code": "PENDING_APPROVAL",
+                                  "message": "device awaiting operator approval"},
+                    })
+                    self._log_event({"type": "connect_rejected_pending", "deviceId": device_id})
+                    await ws.close(code=1008, message=b"pending approval")
+                    break
+
                 self._active_ws[conn_id] = ws
+                self._device_ws[device_id] = ws
 
                 await ws.send_json({
                     "type": "res", "id": frame.get("id"), "ok": True,
@@ -184,6 +305,8 @@ class R1ShimAdapter(BasePlatformAdapter):
                         "uptimeMs": 0,
                     },
                 })
+                # Deliver anything queued while this device was offline.
+                await self._flush_pending(device_id, ws)
                 continue
 
             if frame.get("type") == "req":
@@ -225,6 +348,9 @@ class R1ShimAdapter(BasePlatformAdapter):
                     await ws.send_json({"type": "res", "id": rid, "ok": True, "payload": {"method": method}})
 
         self._active_ws.pop(conn_id, None)
+        # Drop the device->ws mapping only if it still points at this socket.
+        if device_id and self._device_ws.get(device_id) is ws:
+            self._device_ws.pop(device_id, None)
         self._log_event({"type": "ws_close", "connId": conn_id})
         return ws
 
@@ -302,18 +428,37 @@ class R1ShimAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[r1_shim] failed to send reply (client may have disconnected): %s", e)
 
-    def _admin_html(self) -> str:
-        paired_info = json.dumps(list(self._paired.values()), indent=2)
+    def _admin_html(self, token_ok: bool = False) -> str:
+        rows = []
+        for d in self._paired.values():
+            did = d.get("deviceId", "")
+            status = d.get("status", "approved")
+            approve = ""
+            if status != "approved" and token_ok:
+                approve = f" &nbsp; <a href='/approve?token={self._token}&deviceId={did}' style='color:#7af'>approve</a>"
+            elif status != "approved":
+                approve = " &nbsp; <span style='color:#888'>(append ?token=&lt;gateway-token&gt; to approve)</span>"
+            rows.append(f"{did} — {d.get('displayName','?')} — <b>{status}</b>{approve}")
+        body = "<br>".join(rows) or "(none)"
         return f"""<!doctype html>
 <html><body style='font-family:system-ui;background:#111;color:#eee;padding:20px'>
 <h1>R1 Shim (gateway adapter)</h1>
-<p>Port: {self._port} | Paired: {len(self._paired)} | Token: {self._token[:8]}...</p>
-<h2>Paired Devices</h2>
-<pre style='background:#222;padding:12px;border-radius:8px'>{paired_info}</pre>
+<p>Port: {self._port} | Paired: {len(self._paired)} | Auto-approve: {self._auto_approve} | Token: {self._token[:8]}...</p>
+<h2>Devices</h2>
+<div style='background:#222;padding:12px;border-radius:8px;line-height:1.8'>{body}</div>
 </body></html>"""
 
+    async def _approve(self, request: web.Request) -> web.Response:
+        if request.query.get("token", "") != self._token:
+            return web.json_response({"ok": False, "error": "unauthorized"}, status=403)
+        device_id = request.query.get("deviceId", "")
+        if device_id not in self._paired:
+            return web.json_response({"ok": False, "error": "unknown device"}, status=404)
+        changed = self.approve_device(device_id)
+        return web.json_response({"ok": True, "deviceId": device_id, "status": "approved", "changed": changed})
+
     async def _healthz(self, request: web.Request) -> web.Response:
-        return web.json_response({"ok": True, "paired": len(self._paired)})
+        return web.json_response({"ok": True, "paired": len(self._paired), "online": len(self._device_ws)})
 
     # BasePlatformAdapter interface
 
@@ -324,6 +469,7 @@ class R1ShimAdapter(BasePlatformAdapter):
         try:
             self._app = web.Application()
             self._app.router.add_get("/", self._ws_handler)
+            self._app.router.add_get("/approve", self._approve)
             self._app.router.add_get("/healthz", self._healthz)
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()
@@ -345,6 +491,7 @@ class R1ShimAdapter(BasePlatformAdapter):
             except Exception:
                 pass
         self._active_ws.clear()
+        self._device_ws.clear()
         if self._site:
             await self._site.stop()
         if self._runner:
@@ -353,8 +500,39 @@ class R1ShimAdapter(BasePlatformAdapter):
         logger.info("[r1_shim] stopped")
 
     async def send(self, chat_id: str, content: str, reply_to=None, metadata=None) -> SendResult:
-        # The response is sent inline in the WS handler, not through send()
+        """Proactive delivery: push `content` to the R1(s) for this chat_id.
+
+        Used by the gateway's DeliveryRouter (cron jobs, cross-platform routing).
+        A reply to a live chat.send is still sent inline in _run_chat; this path is
+        for messages the R1 didn't ask for. Offline devices get the message queued
+        and flushed on their next connect.
+        """
+        targets = self._resolve_targets(chat_id)
+        if not targets:
+            return SendResult(success=False, error="no R1 device for chat_id")
+        delivered = 0
+        for device_id in targets:
+            ws = self._device_ws.get(device_id)
+            if ws is not None and not ws.closed:
+                try:
+                    await self._send_chat_event(ws, content)
+                    delivered += 1
+                    continue
+                except Exception as e:
+                    logger.warning("[r1_shim] proactive send to %s failed, queuing: %s", device_id, e)
+            self._queue_pending(device_id, content)
+        # Success if delivered live to at least one device, or queued for later.
         return SendResult(success=True)
+
+    def _resolve_targets(self, chat_id: str) -> List[str]:
+        """Map a chat_id to the device ids it addresses.
+
+        `r1:<device_id>` targets that one device; the unified-session chat id (or an
+        unknown id) fans out to every approved paired device.
+        """
+        if chat_id and chat_id.startswith("r1:") and chat_id[3:] not in ("", "unknown"):
+            return [chat_id[3:]]
+        return [d for d, p in self._paired.items() if self._is_approved(p)]
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": "Rabbit R1", "type": "r1_shim"}
