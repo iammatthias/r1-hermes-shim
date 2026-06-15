@@ -21,6 +21,7 @@ R1 are queued and flushed on its next connect.
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -28,7 +29,7 @@ import os
 import secrets
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from aiohttp import web, WSMsgType
@@ -335,6 +336,7 @@ class R1ShimAdapter(BasePlatformAdapter):
 
                 elif method == "chat.send":
                     message_text = params.get("message", "")
+                    attachments = params.get("attachments") or []
                     run_id = params.get("idempotencyKey") or rid or secrets.token_hex(8)
                     session_key = params.get("sessionKey", "main")
 
@@ -348,6 +350,7 @@ class R1ShimAdapter(BasePlatformAdapter):
                         message_text=message_text,
                         run_id=run_id,
                         session_key=session_key,
+                        attachments=attachments,
                     ))
 
                 else:
@@ -361,7 +364,65 @@ class R1ShimAdapter(BasePlatformAdapter):
         self._log_event({"type": "ws_close", "connId": conn_id})
         return ws
 
-    async def _run_chat(self, ws, device_id, message_text, run_id, session_key):
+    def _save_attachments(self, attachments) -> Tuple[List[str], List[str]]:
+        """Decode inbound R1 attachments (base64) to files Hermes vision can read.
+
+        The R1 sends a photo inside chat.send as
+        ``attachments: [{type:"image", mimeType, fileName, content:<base64>}]``.
+        Hermes carries inbound images as MessageEvent.media_urls (local file paths)
+        + media_types, so we write each image to ~/.hermes/r1_shim/media/ and return
+        the paths. Returns (media_urls, media_types).
+        """
+        paths: List[str] = []
+        types: List[str] = []
+        if not attachments:
+            return paths, types
+        media_dir = self._state_dir / "media"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        for att in attachments:
+            if not isinstance(att, dict):
+                continue
+            content = att.get("content")
+            mime = att.get("mimeType", "") or ""
+            atype = att.get("type", "") or ""
+            if not content:
+                continue
+            if atype == "image" or mime.startswith("image/"):
+                try:
+                    raw = base64.b64decode(content)
+                except Exception as e:
+                    logger.warning("[r1_shim] could not decode image attachment: %s", e)
+                    continue
+                ext = (".png" if "png" in mime else ".webp" if "webp" in mime
+                       else ".gif" if "gif" in mime else ".jpg")
+                path = media_dir / (secrets.token_hex(12) + ext)
+                try:
+                    path.write_bytes(raw)
+                except Exception as e:
+                    logger.warning("[r1_shim] could not write image attachment: %s", e)
+                    continue
+                paths.append(str(path))
+                types.append(mime or "image/jpeg")
+                self._log_event({"type": "attachment_saved", "kind": "image",
+                                 "bytes": len(raw), "path": str(path)})
+            else:
+                # Unknown attachment kind (audio? video?) — log its shape for protocol work.
+                logger.info("[r1_shim] unsupported attachment type=%s mime=%s (skipped)", atype, mime)
+                self._log_event({"type": "attachment_skipped", "attType": atype, "mime": mime})
+        self._prune_media(media_dir)
+        return paths, types
+
+    @staticmethod
+    def _prune_media(media_dir, keep: int = 100) -> None:
+        """Keep the media cache bounded — drop all but the newest `keep` files."""
+        try:
+            files = sorted(media_dir.glob("*"), key=lambda p: p.stat().st_mtime)
+            for p in files[:-keep]:
+                p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    async def _run_chat(self, ws, device_id, message_text, run_id, session_key, attachments=None):
         """Run the agent in a background task and send the reply when done."""
         # Use the unified session source so R1 shares the same session as
         # the primary Telegram DM.  This means messages from R1 and Telegram
@@ -388,10 +449,13 @@ class R1ShimAdapter(BasePlatformAdapter):
                 user_id=device_id,
                 user_name=self._paired.get(device_id, {}).get("displayName", "Rabbit R1"),
             )
+        media_urls, media_types = self._save_attachments(attachments)
         event = MessageEvent(
             text=message_text,
-            message_type=MessageType.TEXT,
+            message_type=MessageType.PHOTO if media_urls else MessageType.TEXT,
             source=source,
+            media_urls=media_urls,
+            media_types=media_types,
         )
 
         try:
