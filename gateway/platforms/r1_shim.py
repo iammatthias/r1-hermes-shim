@@ -245,15 +245,22 @@ class R1ShimAdapter(BasePlatformAdapter):
             except Exception:
                 continue
 
-            # Frame capture for protocol discovery. Never log the connect frame's
-            # params (they carry the auth token); for everything else record the
-            # param keys + a truncated snapshot so new frame shapes (voice, camera,
-            # attachments, ...) can be reverse-engineered from events.jsonl.
+            # Frame capture for protocol discovery: record each inbound frame's param
+            # keys + a truncated snapshot so new frame shapes (voice, camera, attachments)
+            # can be reverse-engineered from events.jsonl. The connect frame is captured
+            # too, but with its auth token redacted — its device/client/scopes reveal what
+            # the R1 advertises (e.g. an audio/talk capability we could target for TTS).
             _method = frame.get("method", "")
             _params = frame.get("params", {}) if isinstance(frame.get("params"), dict) else {}
             _log_row = {"type": "frame_in", "connId": conn_id, "method": _method,
                         "paramKeys": sorted(_params.keys())}
-            if _method != "connect":
+            if _method == "connect":
+                _red = dict(_params)
+                if isinstance(_red.get("auth"), dict):
+                    _red["auth"] = {k: ("<redacted>" if k == "token" else v)
+                                    for k, v in _red["auth"].items()}
+                _log_row["paramsSnippet"] = json.dumps(_red)[:1000]
+            else:
                 _log_row["paramsSnippet"] = json.dumps(_params)[:600]
             self._log_event(_log_row)
 
