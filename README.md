@@ -238,14 +238,19 @@ The pairing QR payload (what `tools/make_qr.py` encodes) is:
   `/?token=<gateway-token>` lists pending devices).
 - **Voice — inbound** ✅ — the R1 transcribes speech on-device and sends it as `chat.send` text, so
   *talking to it* already works.
-- **Voice — talk-back (TTS)** ✅ — the shim answers the R1's `talk.speak` RPC with synthesized
-  audio (edge-tts, free, no key). Voice via `R1_SHIM_TTS_VOICE` (default `en-US-AriaNeural`);
-  format via `R1_SHIM_TTS_FORMAT` = `mp3` (default, MediaPlayer) or `pcm` (raw `pcm_24000` →
-  AudioTrack, lower latency, transcoded by ffmpeg). On synthesis failure it returns a
-  fallback-eligible error so the R1 uses its **own on-device TTS** instead of going silent.
-  **Gated on the device:** the R1 only calls `talk.speak` when its on-device *"speak replies"*
-  toggle is on — the gateway can't force it. (Mechanism confirmed from the OpenClaw source: the
-  device drives TTS via `talk.speak`; the gateway never pushes audio for chat replies.)
+- **Voice — talk-back (TTS)** ⚠️ **implemented, but not reachable on current R1 firmware.** The
+  shim answers the `talk.speak` RPC with synthesized audio (edge-tts, free, no key; voice via
+  `R1_SHIM_TTS_VOICE`, format via `R1_SHIM_TTS_FORMAT` = `mp3` default / `pcm` raw `pcm_24000` via
+  ffmpeg; on failure it returns a fallback-eligible error so a device uses its own on-device TTS).
+  **Any OpenClaw _node_ client that calls `talk.speak` will speak.** But a Rabbit R1 (rabbitOS)
+  connects only as a single **`role:"operator"`** session and never opens the **`role:"node"`,
+  `talk`-capable** session OpenClaw's spoken-reply path requires. Confirmed from the
+  [openclaw/openclaw](https://github.com/openclaw/openclaw) source: TTS is produced *device-side*
+  by the node client (gated on `ttsOnAllResponses`, flippable only by a `talk.ptt.*` `node.invoke`
+  delivered to a registered node), and there is **no** `hello-ok` field, `talk.config` value, or
+  chat-reply flag the gateway can use to enable it. So the gateway cannot make this R1 talk back —
+  it's an R1-firmware limitation, not a shim gap. (Inbound voice is unaffected: the R1 transcribes
+  speech to `chat.send` text on-device.)
 - **Camera** ⚠️ — photos taken on the R1 have only ever reached the shim as `chat.send` *text*;
   whether image bytes ride in the params (vs. never leaving the device) is being captured.
 - **No streaming** — replies are a single delta+final pair, not incremental tokens (true streaming
