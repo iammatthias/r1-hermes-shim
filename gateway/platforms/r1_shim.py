@@ -98,11 +98,6 @@ class R1ShimAdapter(BasePlatformAdapter):
         self._pending_responses: Dict[str, asyncio.Future] = {}
         # device_id -> [text, ...] queued while the R1 was offline; flushed on connect.
         self._pending: Dict[str, List[str]] = {}
-        # Node sessions (the talk-capable role). The R1 only ever opened an operator session
-        # with us; this tracks any role:"node" session it opens so we can push a talk.ptt invoke
-        # (the chain that unlocks TTS talk-back). nodeId -> info, nodeId -> ws.
-        self._nodes: Dict[str, Dict[str, Any]] = {}
-        self._node_ws: Dict[str, web.WebSocketResponse] = {}
 
         # State persistence
         from hermes_constants import get_hermes_home
@@ -236,73 +231,6 @@ class R1ShimAdapter(BasePlatformAdapter):
                     self._queue_pending(device_id, leftover)
                 break
 
-    def _hello_ok(self, role: str, scopes, conn_id: str, device_token=None) -> Dict[str, Any]:
-        """Build a hello-ok that advertises a *full* OpenClaw gateway — so a node-capable client
-        (the R1) sees a complete gateway and will, ideally, open its talk-capable node session."""
-        payload = {
-            "type": "hello-ok",
-            "protocol": 3,
-            "server": {"id": "intern-gateway-shim", "version": "1.0", "connId": conn_id},
-            "auth": {"role": role, "scopes": list(scopes)},
-            "policy": {"tickIntervalMs": 15000, "maxPayload": 1048576, "maxBufferedBytes": 8388608},
-            "presence": [],
-            "health": {"ok": True, "status": "ok"},
-            "stateVersion": 1,
-            "uptimeMs": 0,
-            "features": {
-                "methods": [
-                    "connect", "chat.send", "chat.history", "health", "gateway.health",
-                    "system-presence", "tools.catalog", "tools.effective",
-                    "talk.speak", "tts.convert", "talk.config",
-                    "talk.session.create", "talk.session.join", "talk.session.appendAudio",
-                    "node.pair.request", "node.pair.list", "node.pair.approve", "node.pair.reject",
-                    "node.invoke",
-                ],
-                "events": [
-                    "connect.challenge", "chat", "presence",
-                    "node.invoke.request", "node.pair.requested", "node.pair.resolved", "talk.event",
-                ],
-            },
-            "snapshot": {"nodes": [], "presence": [], "sessions": []},
-        }
-        if device_token:
-            payload["auth"]["deviceToken"] = device_token
-        return payload
-
-    def _register_node(self, node_id: str, conn_id: str, ws, params) -> None:
-        client = params.get("client", {}) if isinstance(params.get("client"), dict) else {}
-        self._nodes[node_id] = {
-            "nodeId": node_id, "connId": conn_id,
-            "caps": params.get("caps") or [],
-            "commands": params.get("commands") or [],
-            "displayName": client.get("displayName"),
-            "mode": client.get("mode"),
-        }
-        self._node_ws[node_id] = ws
-
-    async def _enable_talk_on_node(self, node_id: str, ws, params) -> None:
-        """Push a talk.ptt invoke to a node that has a talk surface, flipping its
-        ttsOnAllResponses=true so it calls talk.speak on every chat final (the talk-back chain)."""
-        caps = params.get("caps") or []
-        commands = params.get("commands") or []
-        has_talk = ("talk" in caps) or any(str(c).startswith("talk.") for c in commands)
-        self._log_event({"type": "node_talk_surface", "nodeId": node_id, "hasTalk": has_talk,
-                         "caps": caps, "commands": commands})
-        await asyncio.sleep(1.0)  # let the node finish its own startup
-        invoke_id = secrets.token_hex(8)
-        try:
-            await ws.send_json({
-                "type": "event", "event": "node.invoke.request",
-                "payload": {"id": invoke_id, "nodeId": node_id, "command": "talk.ptt.once",
-                            "paramsJSON": None, "idempotencyKey": secrets.token_hex(8),
-                            "timeoutMs": 15000},
-            })
-            self._log_event({"type": "talk_ptt_sent", "nodeId": node_id, "invokeId": invoke_id,
-                             "command": "talk.ptt.once"})
-            logger.info("[r1_shim] sent talk.ptt.once node.invoke to %s", node_id)
-        except Exception as e:
-            logger.warning("[r1_shim] failed to send talk.ptt node.invoke to %s: %s", node_id, e)
-
     async def _ws_handler(self, request: web.Request) -> web.StreamResponse:
         if request.headers.get("Upgrade", "").lower() != "websocket":
             # Serve admin page for browser visits
@@ -352,12 +280,8 @@ class R1ShimAdapter(BasePlatformAdapter):
 
             if frame.get("type") == "req" and frame.get("method") == "connect":
                 params = frame.get("params", {})
-                auth = params.get("auth", {}) if isinstance(params.get("auth"), dict) else {}
-                supplied = auth.get("token", "") or auth.get("bootstrapToken", "")
-                role = params.get("role", "operator")
-                client = params.get("client", {}) if isinstance(params.get("client"), dict) else {}
-                device = params.get("device", {}) if isinstance(params.get("device"), dict) else {}
-                node_id = device.get("id") or client.get("id") or secrets.token_hex(12)
+                auth = params.get("auth", {})
+                supplied = auth.get("token", "")
 
                 if supplied != self._token and supplied not in self._device_tokens:
                     await ws.send_json({
@@ -367,26 +291,8 @@ class R1ShimAdapter(BasePlatformAdapter):
                     await ws.close(code=1008, message=b"auth mismatch")
                     break
 
-                # --- NODE session (the talk-capable role). Registering it and pushing a
-                # talk.ptt invoke is the chain that could unlock TTS talk-back. The R1 has only
-                # ever opened an operator session with us; accept + log any node session fully. ---
-                if role == "node":
-                    device_id = node_id
-                    self._register_node(node_id, conn_id, ws, params)
-                    await ws.send_json({
-                        "type": "res", "id": frame.get("id"), "ok": True,
-                        "payload": self._hello_ok("node", [], conn_id),
-                    })
-                    self._log_event({"type": "node_connected", "nodeId": node_id,
-                                     "caps": params.get("caps"), "commands": params.get("commands"),
-                                     "mode": client.get("mode")})
-                    logger.info("[r1_shim] NODE session registered: %s caps=%s commands=%s",
-                                node_id, params.get("caps"), params.get("commands"))
-                    asyncio.create_task(self._enable_talk_on_node(node_id, ws, params))
-                    continue
-
-                # --- OPERATOR session (the existing chat path) ---
-                device_id = node_id
+                device = params.get("device", {})
+                device_id = device.get("id") or secrets.token_hex(12)
                 paired = self._ensure_device(device_id, params)
 
                 # Device approval gate (no-op when auto_approve, the default).
@@ -405,10 +311,20 @@ class R1ShimAdapter(BasePlatformAdapter):
 
                 await ws.send_json({
                     "type": "res", "id": frame.get("id"), "ok": True,
-                    "payload": self._hello_ok(
-                        params.get("role", "operator"),
-                        params.get("scopes") or ["operator.read", "operator.write"],
-                        conn_id, device_token=paired["deviceToken"]),
+                    "payload": {
+                        "type": "hello-ok",
+                        "protocol": 3,
+                        "policy": {"tickIntervalMs": 15000},
+                        "auth": {
+                            "deviceToken": paired["deviceToken"],
+                            "role": params.get("role", "operator"),
+                            "scopes": params.get("scopes") or ["operator.read", "operator.write"],
+                        },
+                        "presence": [],
+                        "health": {"ok": True, "status": "ok"},
+                        "stateVersion": 1,
+                        "uptimeMs": 0,
+                    },
                 })
                 # Deliver anything queued while this device was offline.
                 await self._flush_pending(device_id, ws)
@@ -456,28 +372,6 @@ class R1ShimAdapter(BasePlatformAdapter):
                     # synthesis latency doesn't stall other frames.
                     asyncio.create_task(self._handle_talk_speak(ws, rid, params))
 
-                elif method == "node.invoke.result":
-                    # The node's reply to our talk.ptt invoke (e.g. ttsOnAllResponses set).
-                    await ws.send_json({"type": "res", "id": rid, "ok": True, "payload": {"ok": True}})
-                    self._log_event({"type": "node_invoke_result", "params": params})
-                    logger.info("[r1_shim] node.invoke.result: %s", params)
-
-                elif method == "node.pair.list":
-                    await ws.send_json({"type": "res", "id": rid, "ok": True, "payload": {
-                        "pending": [],
-                        "paired": [{"nodeId": n, "caps": d.get("caps"), "commands": d.get("commands")}
-                                   for n, d in self._nodes.items()]}})
-
-                elif method in ("node.pair.approve", "node.pair.reject"):
-                    await ws.send_json({"type": "res", "id": rid, "ok": True,
-                                        "payload": {"requestId": params.get("requestId"), "ok": True}})
-
-                elif method == "node.pair.request":
-                    # Device-initiated pairing — auto-approve (we control the gateway).
-                    await ws.send_json({"type": "res", "id": rid, "ok": True,
-                                        "payload": {"requestId": secrets.token_hex(8), "status": "approved"}})
-                    self._log_event({"type": "node_pair_request", "paramKeys": sorted(params.keys())})
-
                 else:
                     # Echo unknown methods
                     await ws.send_json({"type": "res", "id": rid, "ok": True, "payload": {"method": method}})
@@ -486,10 +380,6 @@ class R1ShimAdapter(BasePlatformAdapter):
         # Drop the device->ws mapping only if it still points at this socket.
         if device_id and self._device_ws.get(device_id) is ws:
             self._device_ws.pop(device_id, None)
-        # Drop any node mapping on this socket.
-        for nid in [n for n, w in self._node_ws.items() if w is ws]:
-            self._node_ws.pop(nid, None)
-            self._nodes.pop(nid, None)
         self._log_event({"type": "ws_close", "connId": conn_id})
         return ws
 
@@ -760,8 +650,6 @@ class R1ShimAdapter(BasePlatformAdapter):
                 pass
         self._active_ws.clear()
         self._device_ws.clear()
-        self._nodes.clear()
-        self._node_ws.clear()
         if self._site:
             await self._site.stop()
         if self._runner:
