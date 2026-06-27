@@ -91,10 +91,17 @@ STATE_DIR_NAME = "r1_shim"
 # Cap the offline queue per device so a long-offline R1 can't grow it without bound.
 MAX_PENDING_PER_DEVICE = 50
 
-# Platform identity. The Hermes Platform enum mints unknown members on demand via
-# its _missing_() hook, so Platform("r1_shim") is valid and identity-stable
-# WITHOUT adding R1_SHIM to the core enum.
-R1_PLATFORM = Platform("r1_shim")
+# Platform identity. The Hermes Platform enum mints this member on demand via its
+# _missing_() hook, but ONLY after register() has put "r1_shim" in the platform
+# registry — so Platform("r1_shim") must be resolved lazily (inside methods that
+# run after registration), NEVER at module import time. Doing it at import would
+# raise ValueError ("not a valid Platform") before register() runs, which would
+# stop the whole plugin from loading.
+R1_PLATFORM_NAME = "r1_shim"
+
+
+def _r1_platform() -> "Platform":
+    return Platform(R1_PLATFORM_NAME)
 
 
 def check_r1_shim_requirements() -> bool:
@@ -109,7 +116,7 @@ class R1ShimAdapter(BasePlatformAdapter):
     """OpenClaw-compatible WebSocket gateway for Rabbit R1."""
 
     def __init__(self, config: PlatformConfig):
-        super().__init__(config, R1_PLATFORM)
+        super().__init__(config, _r1_platform())
         extra = config.extra or {}
         self._port = int(extra.get("port", os.getenv("R1_SHIM_PORT", str(DEFAULT_PORT))))
         self._token = extra.get("token", os.getenv("R1_SHIM_TOKEN", secrets.token_hex(32)))
@@ -554,7 +561,7 @@ class R1ShimAdapter(BasePlatformAdapter):
             try:
                 unified_platform = Platform(unified_platform_str)
             except ValueError:
-                unified_platform = R1_PLATFORM
+                unified_platform = _r1_platform()
             source = SessionSource(
                 platform=unified_platform,
                 chat_id=unified_chat_id,
@@ -564,7 +571,7 @@ class R1ShimAdapter(BasePlatformAdapter):
             )
         else:
             source = SessionSource(
-                platform=R1_PLATFORM,
+                platform=_r1_platform(),
                 chat_id=f"r1:{device_id}" if device_id else "r1:unknown",
                 chat_type="dm",
                 user_id=device_id,
@@ -772,7 +779,7 @@ def _is_connected(cfg) -> bool:
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
     ctx.register_platform(
-        name="r1_shim",
+        name=R1_PLATFORM_NAME,
         label="Rabbit R1",
         adapter_factory=lambda cfg: R1ShimAdapter(cfg),
         check_fn=check_r1_shim_requirements,
