@@ -661,7 +661,9 @@ class R1ShimAdapter(BasePlatformAdapter):
 
     # BasePlatformAdapter interface
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # is_reconnect is part of the base contract; for a listening WS server a
+        # reconnect is the same as a fresh start, so we accept and ignore it.
         if not AIOHTTP_AVAILABLE:
             logger.warning("[r1_shim] aiohttp not available")
             return False
