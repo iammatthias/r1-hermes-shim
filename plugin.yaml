@@ -1,0 +1,19 @@
+name: r1-shim
+label: Rabbit R1
+kind: platform
+version: 2.0.0
+description: >
+  Third-party OpenClaw-compatible WebSocket gateway that connects a Rabbit R1
+  handheld to Hermes Agent as a first-class messaging platform. The R1 pairs via
+  a QR bootstrap and chats through the standard Hermes agent pipeline with the
+  same model, memory, tools, and sessions as Telegram. Camera photos route to vision;
+  proactive/cron delivery and an offline queue are supported. Installs as a
+  plugin in ~/.hermes/plugins/, so it needs ZERO Hermes source edits and
+  survives `hermes update`.
+author: iammatthias
+requires_env:
+  - name: R1_SHIM_TOKEN
+    description: "Gateway pairing token. Its presence auto-enables the R1 channel; keep it stable for a stable pairing QR."
+    prompt: "R1 shim gateway token"
+    password: true
+    category: setting

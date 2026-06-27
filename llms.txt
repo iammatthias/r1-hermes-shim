@@ -1,213 +1,48 @@
-# R1 Hermes Shim — Agent Installation Guide
+# R1 Hermes Shim — agent install guide
 
-> This file is written for an AI agent (Hermes, Claude Code, Codex, etc.) to install and
-> configure the R1 Hermes Shim. Give your agent this URL and ask it to install the shim.
+You are installing a Rabbit R1 channel into Hermes Agent. This is a Hermes
+PLATFORM PLUGIN. Do NOT patch the Hermes source tree. Earlier versions did
+(copying r1_shim.py into gateway/platforms/ and editing config.py/run.py/
+authz_mixin.py); that broke on every `hermes update`. The plugin path needs
+zero core edits and survives updates.
 
-## What This Is
+## How it works
+- The repo is a plugin: plugin.yaml (kind: platform) + __init__.py (exports
+  `register`) + adapter.py (R1ShimAdapter + `register(ctx)`).
+- It registers a `r1_shim` platform via `ctx.register_platform()`. Hermes mints
+  `Platform("r1_shim")` on demand (Platform._missing_), reads `allow_all_env`
+  off the registry entry for authorization, and auto-enables the channel when
+  `R1_SHIM_TOKEN` is set. No core files change.
+- It runs an OpenClaw-compatible WebSocket server (default port 18790). The R1
+  pairs via a QR (scripts/make_qr.py) and chats through the normal Hermes
+  pipeline.
 
-A THIRD-PARTY OpenClaw-compatible WebSocket gateway adapter that connects a Rabbit R1 device to a
-Hermes Agent instance as a messaging channel. The R1 sends messages through the same gateway
-pipeline as Telegram — same model, same memory, same tools, same session store.
+## Install steps
+1. Install + enable the plugin (platform plugins are allow-listed):
+   hermes plugins install iammatthias/r1-hermes-shim
+   hermes plugins enable r1-shim
+2. Configure ~/.hermes/.env (a fixed token keeps the pairing QR stable):
+   R1_SHIM_TOKEN=<openssl rand -hex 32>
+   R1_SHIM_PORT=18790            # avoid 18789 if an intern-server stub owns it
+   R1_SHIM_ALLOW_ALL_USERS=true  # the R1 authenticates at the WS layer
+3. Restart the gateway:
+   hermes gateway restart   # or systemctl restart hermes-gateway
+4. Verify:
+   journalctl -u hermes-gateway | grep -i r1_shim | tail   # want "listening on ws://0.0.0.0:18790/"
+   ss -ltnp | grep ':18790'                                  # want a LISTEN line
+5. Pairing QR:
+   R1_SHIM_TOKEN=<token> R1_SHIM_PORT=18790 python3 scripts/make_qr.py
+   # scan r1-pairing-qr.png in R1 -> Settings -> OpenClaw
 
-**This is NOT a built-in Hermes feature.** Upstream Hermes (`NousResearch/hermes-agent`) does not
-ship `r1_shim` — not even at `v0.16.0` / tag `v2026.6.5`. You install it by copying an adapter
-file into the Hermes source and applying a few small patches to two Hermes files. Tested against
-Hermes `v0.16.0`.
+## Migrating off the old patch-based install
+If a previous install patched the Hermes source, revert it first so `hermes
+update` runs clean, then install the plugin:
+  HERMES_SRC=/usr/local/lib/hermes-agent   # or ~/.hermes/hermes-agent
+  git -C "$HERMES_SRC" checkout -- gateway/config.py gateway/run.py gateway/authz_mixin.py
+  rm -f "$HERMES_SRC/gateway/platforms/r1_shim.py"
+Paired-device state in ~/.hermes/r1_shim/ is preserved across the migration.
 
-## IMPORTANT: these patches modify the Hermes source tree
-
-Hermes is installed as a git checkout of `NousResearch/hermes-agent`. The changes below are
-**uncommitted working-tree edits** to that checkout, so **`hermes update` or a reinstall discards
-them.** Make every step idempotent and re-apply after any Hermes upgrade.
-
-## 1. Locate the Hermes source
-
-```bash
-for d in /usr/local/lib/hermes-agent "$HOME/.hermes/hermes-agent"; do
-  [ -f "$d/gateway/config.py" ] && HERMES_SRC="$d" && break
-done
-echo "HERMES_SRC=$HERMES_SRC"
-```
-
-## 2. Copy the adapter
-
-```bash
-curl -sL https://raw.githubusercontent.com/iammatthias/r1-hermes-shim/main/gateway/platforms/r1_shim.py \
-  -o "$HERMES_SRC/gateway/platforms/r1_shim.py"
-```
-
-### Quick apply for a pinned tag (recommended on v2026.6.5)
-
-`$HERMES_SRC` is a git checkout, so if your Hermes is exactly tag `v2026.6.5` you can apply the
-config.py + run.py edits (steps 3–4) in one shot with the verified patch — idempotent via the
-reverse-check:
-
-```bash
-P=/tmp/r1-shim.patch
-curl -sL https://raw.githubusercontent.com/iammatthias/r1-hermes-shim/main/patches/hermes-v2026.6.5.patch -o "$P"
-if git -C "$HERMES_SRC" apply --reverse --check "$P" 2>/dev/null; then echo "already applied"
-elif git -C "$HERMES_SRC" apply --check "$P" 2>/dev/null; then git -C "$HERMES_SRC" apply "$P"; echo applied
-else echo "does not apply cleanly — your Hermes is not v2026.6.5; use the manual steps below"; fi
-```
-
-If that applied cleanly, skip to step 6. Otherwise (different Hermes version), do steps 3–4 by hand:
-
-## 3. Patch gateway/config.py
-
-**3a.** Add `R1_SHIM = "r1_shim"` to the `Platform` enum (e.g. after `WECOM = "wecom"`). Idempotent
-check: skip if `grep -q 'R1_SHIM = "r1_shim"' "$HERMES_SRC/gateway/config.py"`.
-
-**3b.** Add this block before `return config` in `load_gateway_config()`:
-
-```python
-    # R1 Shim (Rabbit R1 OpenClaw-compatible gateway)
-    r1_shim_enabled = os.getenv("R1_SHIM_ENABLED", "").lower() in ("true", "1", "yes")
-    r1_shim_token = os.getenv("R1_SHIM_TOKEN", "")
-    r1_shim_port = os.getenv("R1_SHIM_PORT")
-    if r1_shim_enabled or r1_shim_token:
-        if Platform.R1_SHIM not in config.platforms:
-            config.platforms[Platform.R1_SHIM] = PlatformConfig()
-        config.platforms[Platform.R1_SHIM].enabled = True
-        if r1_shim_token:
-            config.platforms[Platform.R1_SHIM].extra["token"] = r1_shim_token
-        if r1_shim_port:
-            try:
-                config.platforms[Platform.R1_SHIM].extra["port"] = int(r1_shim_port)
-            except ValueError:
-                pass
-```
-
-## 4. Patch gateway/run.py
-
-**4a.** In `_create_adapter`, before the final `return None`:
-
-```python
-        elif platform == Platform.R1_SHIM:
-            from gateway.platforms.r1_shim import R1ShimAdapter, check_r1_shim_requirements
-            if not check_r1_shim_requirements():
-                logger.warning("R1 Shim: aiohttp not installed")
-                return None
-            return R1ShimAdapter(config)
-```
-
-**4b.** Add `Platform.R1_SHIM` to the auth bypass in `_is_user_authorized`:
-
-```python
-if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK, Platform.R1_SHIM):
-```
-
-## 5. (Optional) Patch hermes_cli/tools_config.py
-
-Cosmetic — the shim works without it. Add to the `PLATFORMS` dict:
-
-```python
-    "r1_shim": {"label": "🐰 Rabbit R1", "default_toolset": "hermes-telegram"},
-```
-
-## 6. Clear Python bytecache
-
-```bash
-find "$HERMES_SRC" -name '__pycache__' -exec rm -rf {} + 2>/dev/null
-```
-
-## 7. Pick a port (mind the collision)
-
-The shim defaults to `18789`. If anything else already speaks the OpenClaw protocol on `18789`
-on this host — most commonly an Autonomous `intern-server` talking to a local gateway/stub — the
-shim cannot bind and crash-loops with `[Errno 98] address already in use`. The two OpenClaw
-dialects are NOT interchangeable (the intern stub answers `{id,result}` frames; the R1 shim
-answers `{type:"res",ok,payload}` challenge/hello-ok frames), so run the shim on its own port:
-
-```bash
-ss -ltnp | grep ':18789' && echo "18789 busy -> use R1_SHIM_PORT=18790"
-```
-
-## 8. Configure ~/.hermes/.env
-
-Append (do NOT overwrite). A FIXED token keeps the pairing QR stable across reboots — pair once:
-
-```bash
-cat >> ~/.hermes/.env <<EOF
-# Rabbit R1 OpenClaw-compatible shim
-R1_SHIM_ENABLED=true
-R1_SHIM_TOKEN=$(openssl rand -hex 32)
-R1_SHIM_PORT=18790
-EOF
-```
-
-## 9. Restart the gateway and verify
-
-```bash
-hermes gateway restart   # or: systemctl restart hermes-gateway
-grep -i r1_shim ~/.hermes/logs/gateway.log | tail -5
-```
-
-Expected:
-```
-[r1_shim] listening on ws://0.0.0.0:18790/
-✓ r1_shim connected
-```
-If you see `failed to start: ... address already in use`, change `R1_SHIM_PORT` and restart.
-
-## 10. Generate the pairing QR
-
-```bash
-LAN_IP=$(ip -4 -o addr show 2>/dev/null | awk '{print $4}' | grep -vE '^(127\.|169\.254\.)' | cut -d/ -f1 | head -1)
-TOKEN=$(grep '^R1_SHIM_TOKEN=' ~/.hermes/.env | cut -d= -f2-)
-PORT=$(grep '^R1_SHIM_PORT=' ~/.hermes/.env | cut -d= -f2-)
-PAYLOAD="{\"type\":\"clawdbot-gateway\",\"version\":1,\"ips\":[\"$LAN_IP\"],\"port\":${PORT:-18790},\"token\":\"$TOKEN\",\"protocol\":\"ws\"}"
-
-qrencode -t PNG -o r1-pairing-qr.png "$PAYLOAD"        # apt install qrencode
-#   or
-npx --yes qrcode "$PAYLOAD" -o r1-pairing-qr.png        # needs node
-#   or
-R1_SHIM_TOKEN="$TOKEN" R1_SHIM_PORT="${PORT:-18790}" python3 tools/make_qr.py
-echo "Scan r1-pairing-qr.png in R1 -> Settings -> OpenClaw"
-```
-
-### Delivering the QR after a gateway reboot
-
-The shim has NO proactive delivery (`send()` is a no-op), and a fresh Hermes has no messaging
-channel configured, so the gateway can't message you the QR. With a FIXED token the QR is stable,
-so render it on each gateway start and serve it somewhere you already reach. A oneshot systemd
-unit ordered `After=hermes-gateway.service` that runs your generator does this and also refreshes
-the LAN IP baked into the QR (DHCP can change it). The Autonomous Intern provisioning kit
-(github.com/iammatthias/intern) is a worked example: it renders the QR into a Caddy-served,
-tailnet-only web root and shows it as a tile in the Hermes dashboard.
-
-## Pair the R1
-
-1. On the Rabbit R1: Settings → OpenClaw (or the pairing/QR-scan option)
-2. Scan the QR; the R1 connects and auto-pairs
-3. Send a message — it runs through the full Hermes agent pipeline
-
-Session keys look like `agent:main:r1_shim:dm:r1:<device-hash>`.
-
-## After upgrading Hermes
-
-`hermes update` / reinstall replaces the source checkout and **wipes steps 2–5**. Re-run them
-(they are idempotent) and restart the gateway. The `~/.hermes/.env` settings (step 8) survive.
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-|---------|-------|-----|
-| `[r1_shim] failed to start: address already in use` | Another OpenClaw listener (e.g. an intern-server gateway/stub) owns the port | Set a different `R1_SHIM_PORT` (e.g. 18790) and restart |
-| `r1_shim` not loaded at all after a Hermes update | Patches wiped by the reinstall | Re-apply steps 2–5, clear `__pycache__`, restart |
-| R1 shows "not a valid creation" | Scanned a Creation QR, not a gateway QR | Use the `clawdbot-gateway` JSON payload QR |
-| R1 connects then disconnects immediately | Token mismatch on reconnect | Adapter accepts gateway + device tokens; keep the token FIXED in `.env` and restart |
-| "(no response)" | Handler returned None (often auth) | Check log for "Unauthorized"; verify `Platform.R1_SHIM` is in the auth bypass (step 4b) |
-| `KeyError: 'r1_shim'` | Missing from `PLATFORMS` in tools_config.py | Add the entry (step 5) and clear `__pycache__` |
-| Gateway won't start | Import error in r1_shim.py | Check the gateway log; ensure `aiohttp` is in the gateway venv |
-
-## Protocol Reference
-
-1. Server sends `connect.challenge` event with nonce
-2. Client sends `connect` request with auth token + device identity
-3. Server responds with `hello-ok` including a device token
-4. Client sends `chat.send` with `{sessionKey, message, idempotencyKey}`
-5. Server acks with `{runId, status: "started"}`
-6. Server sends `chat` events: `state: "delta"` then `state: "final"` with the reply
-
-Auth has two layers: gateway token (from QR) for the initial connect, device token (from
-hello-ok) for reconnects.
+## Optional env
+R1_SHIM_AUTO_APPROVE (default true), R1_SHIM_TTS_VOICE, R1_SHIM_TTS_FORMAT
+(mp3|pcm), R1_SHIM_UNIFIED_CHAT_ID + R1_SHIM_UNIFIED_PLATFORM (share one
+session with another channel).

@@ -1,35 +1,62 @@
 """
-Rabbit R1 OpenClaw-compatible shim platform adapter.
+Rabbit R1 OpenClaw-compatible shim — Hermes platform plugin.
 
 Runs a WebSocket server that speaks enough of the OpenClaw gateway protocol
-for a Rabbit R1 to connect, pair, and send messages. Messages are routed
-through the standard Hermes gateway message pipeline (_handle_message),
-so the R1 gets the same agent, same sessions, same tools as Telegram.
+for a Rabbit R1 to connect, pair, and send messages. Messages route through the
+standard Hermes gateway pipeline (_handle_message), so the R1 gets the same
+agent, sessions, and tools as Telegram.
 
-Configuration in config.yaml:
-  platforms:
-    r1_shim:
-      enabled: true
-      extra:
-        port: 18789
-        token: "<your-token>"  # or set R1_SHIM_TOKEN env var
-        auto_approve: true       # false => new devices wait for operator approval
+This is a PLUGIN (kind: platform). It registers itself via ``register(ctx)``
+and requires ZERO edits to the Hermes source tree, so ``hermes update`` no
+longer wipes it. Drop it in ``~/.hermes/plugins/`` (or ``hermes plugins
+install iammatthias/r1-hermes-shim``) and enable it.
 
-Proactive delivery: send() pushes a message to a connected R1 (used by cron and
-cross-platform routing via the gateway's DeliveryRouter). Messages for an offline
-R1 are queued and flushed on its next connect.
+Enable + configure via env (seeded into PlatformConfig.extra by
+``_env_enablement`` below):
+  R1_SHIM_TOKEN            gateway pairing token — its presence AUTO-ENABLES the
+                           channel; keep it stable for a stable pairing QR
+  R1_SHIM_PORT             WS listen port (default 18790; 18789 collides with the
+                           intern-gateway-shim stub, so default is 18790)
+  R1_SHIM_ALLOW_ALL_USERS  authorize all R1 devices (the R1 authenticates at the
+                           WS layer with the gateway token, so this is expected)
+  R1_SHIM_AUTO_APPROVE     auto-approve new devices (default true)
+  R1_SHIM_TTS_VOICE / R1_SHIM_TTS_FORMAT   talk-back voice / format
+  R1_SHIM_UNIFIED_CHAT_ID / R1_SHIM_UNIFIED_PLATFORM   share one session with
+                           another channel (e.g. the primary Telegram DM)
+
+Proactive delivery: send() pushes to a connected R1 (cron / cross-platform
+routing via DeliveryRouter). Messages for an offline R1 are queued and flushed
+on its next connect.
 """
 
 import asyncio
 import base64
-import hashlib
 import json
 import logging
 import os
 import secrets
+import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+# This plugin lives outside the Hermes package tree (~/.hermes/plugins/), so the
+# ``gateway.*`` imports below are absolute. The gateway process that loads this
+# plugin already has the Hermes root on sys.path; this guard is belt-and-braces
+# for odd load contexts (it derives the root from the always-importable
+# hermes_constants module rather than from __file__, whose depth varies by
+# install location).
+try:  # pragma: no cover - exercised only when the root isn't already on path
+    import gateway.config  # noqa: F401
+except ModuleNotFoundError:
+    try:
+        import hermes_constants as _hc
+
+        _root = str(Path(_hc.__file__).resolve().parent)
+        if _root not in sys.path:
+            sys.path.insert(0, _root)
+    except Exception:
+        pass
 
 try:
     from aiohttp import web, WSMsgType
@@ -57,10 +84,17 @@ from gateway.platforms.base import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PORT = 18789
+# 18790, not 18789: on the Intern devices the intern-gateway-shim stub owns
+# :18789 (intern-server's lifecycle WS), so the R1 channel must not collide.
+DEFAULT_PORT = 18790
 STATE_DIR_NAME = "r1_shim"
 # Cap the offline queue per device so a long-offline R1 can't grow it without bound.
 MAX_PENDING_PER_DEVICE = 50
+
+# Platform identity. The Hermes Platform enum mints unknown members on demand via
+# its _missing_() hook, so Platform("r1_shim") is valid and identity-stable
+# WITHOUT adding R1_SHIM to the core enum.
+R1_PLATFORM = Platform("r1_shim")
 
 
 def check_r1_shim_requirements() -> bool:
@@ -75,7 +109,7 @@ class R1ShimAdapter(BasePlatformAdapter):
     """OpenClaw-compatible WebSocket gateway for Rabbit R1."""
 
     def __init__(self, config: PlatformConfig):
-        super().__init__(config, Platform.R1_SHIM)
+        super().__init__(config, R1_PLATFORM)
         extra = config.extra or {}
         self._port = int(extra.get("port", os.getenv("R1_SHIM_PORT", str(DEFAULT_PORT))))
         self._token = extra.get("token", os.getenv("R1_SHIM_TOKEN", secrets.token_hex(32)))
@@ -520,7 +554,7 @@ class R1ShimAdapter(BasePlatformAdapter):
             try:
                 unified_platform = Platform(unified_platform_str)
             except ValueError:
-                unified_platform = Platform.R1_SHIM
+                unified_platform = R1_PLATFORM
             source = SessionSource(
                 platform=unified_platform,
                 chat_id=unified_chat_id,
@@ -530,7 +564,7 @@ class R1ShimAdapter(BasePlatformAdapter):
             )
         else:
             source = SessionSource(
-                platform=Platform.R1_SHIM,
+                platform=R1_PLATFORM,
                 chat_id=f"r1:{device_id}" if device_id else "r1:unknown",
                 chat_type="dm",
                 user_id=device_id,
@@ -694,3 +728,67 @@ class R1ShimAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": "Rabbit R1", "type": "r1_shim"}
+
+
+# ---------------------------------------------------------------------------
+# Plugin entry point
+# ---------------------------------------------------------------------------
+
+def _env_enablement() -> Optional[dict]:
+    """Auto-enable + seed PlatformConfig.extra from env.
+
+    Called by the plugin system during ``_apply_env_overrides`` BEFORE the
+    adapter is constructed. Returning a dict (when R1_SHIM_TOKEN is set)
+    auto-enables the platform and seeds its config, so the channel needs no
+    config.yaml block — just env vars in ~/.hermes/.env.
+    """
+    token = os.getenv("R1_SHIM_TOKEN")
+    if not token:
+        return None
+    extra: Dict[str, Any] = {"token": token}
+    port = os.getenv("R1_SHIM_PORT")
+    if port:
+        try:
+            extra["port"] = int(port)
+        except ValueError:
+            pass
+    for env_name, key in (
+        ("R1_SHIM_AUTO_APPROVE", "auto_approve"),
+        ("R1_SHIM_TTS_VOICE", "tts_voice"),
+        ("R1_SHIM_TTS_FORMAT", "tts_format"),
+    ):
+        val = os.getenv(env_name)
+        if val is not None:
+            extra[key] = val
+    return extra
+
+
+def _is_connected(cfg) -> bool:
+    """Report the channel as connected once a token is configured (env or YAML)."""
+    extra = getattr(cfg, "extra", {}) or {}
+    return bool(extra.get("token") or os.getenv("R1_SHIM_TOKEN"))
+
+
+def register(ctx) -> None:
+    """Plugin entry point — called by the Hermes plugin system."""
+    ctx.register_platform(
+        name="r1_shim",
+        label="Rabbit R1",
+        adapter_factory=lambda cfg: R1ShimAdapter(cfg),
+        check_fn=check_r1_shim_requirements,
+        is_connected=_is_connected,
+        required_env=["R1_SHIM_TOKEN"],
+        install_hint="set R1_SHIM_TOKEN (and ensure aiohttp is installed)",
+        env_enablement_fn=_env_enablement,
+        # The R1 authenticates at the WebSocket layer with the gateway token, so
+        # every message it forwards is already trusted — authorize all users.
+        # Replaces the old authz_mixin source patch.
+        allow_all_env="R1_SHIM_ALLOW_ALL_USERS",
+        emoji="🐰",
+        pii_safe=False,
+        platform_hint=(
+            "You are connected to a Rabbit R1 handheld over an OpenClaw-compatible "
+            "channel. Replies are read aloud and shown on a small screen, so keep "
+            "them short and plain — no markdown tables, no long code blocks."
+        ),
+    )
