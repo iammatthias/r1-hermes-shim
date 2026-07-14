@@ -1,5 +1,10 @@
 # R1 Hermes Shim
 
+> [!IMPORTANT]
+> **This repo is archived.** rabbitOS now supports Hermes Agent natively through rabbit's own agent integration. Follow rabbit's guide, [Agents on rabbit r1](https://www.rabbit.tech/support/article/agents-on-rabbit-r1), and install the rabbit agent from [rabbithole.rabbit.tech](https://rabbithole.rabbit.tech). No shim, no patches.
+>
+> Everything below is kept for reference. The shim still works as an out-of-tree platform plugin (`hermes plugins install iammatthias/r1-hermes-shim`), but the native path is the one to use.
+
 A third-party OpenClaw-compatible WebSocket gateway that connects a [Rabbit R1](https://www.rabbit.tech/) to [Hermes Agent](https://github.com/NousResearch/hermes-agent) as a first-class messaging channel.
 
 The R1 talks to the gateway exactly like it would talk to OpenClaw, and messages route through the Hermes agent pipeline with the same model, memory, tools, and sessions as Telegram or any other channel.
